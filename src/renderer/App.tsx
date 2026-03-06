@@ -790,7 +790,8 @@ export function App() {
         }
       }
 
-      // Clean up shell terminal session
+      // Clean up terminal sessions (both Claude CLI and shell fallback)
+      await sessionRegistry.dispose(task.id);
       sessionRegistry.dispose(`shell:${task.id}`);
 
       await window.electronAPI.deleteTask(task.id);
@@ -804,7 +805,19 @@ export function App() {
   }
 
   async function handleArchiveTask(id: string) {
+    // Dispose terminal sessions and clear snapshot before archiving
+    // so stale PTY/snapshot state doesn't leak into a future restore
+    await sessionRegistry.dispose(id);
+    sessionRegistry.dispose(`shell:${id}`);
+    await window.electronAPI.ptyClearSnapshot(id);
+
     await window.electronAPI.archiveTask(id);
+
+    // Clear active task immediately if we're archiving it
+    if (activeTaskId === id) {
+      setActiveTaskId(null);
+    }
+
     // Find which project this task belongs to and reload
     for (const [projectId, tasks] of Object.entries(tasksByProject)) {
       if (tasks.some((t) => t.id === id)) {
@@ -815,6 +828,11 @@ export function App() {
   }
 
   async function handleRestoreTask(id: string) {
+    // Dispose any stale session that might linger from before the archive,
+    // so the next attach() starts fresh with a new PTY + snapshot load
+    await sessionRegistry.dispose(id);
+    sessionRegistry.dispose(`shell:${id}`);
+
     await window.electronAPI.restoreTask(id);
     for (const [projectId, tasks] of Object.entries(tasksByProject)) {
       if (tasks.some((t) => t.id === id)) {
