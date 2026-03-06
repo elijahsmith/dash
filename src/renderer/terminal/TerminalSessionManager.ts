@@ -43,6 +43,8 @@ export class TerminalSessionManager {
   private lastPtyCols = 0;
   private lastPtyRows = 0;
   private writeScrollRafPending = false;
+  private lastWriteTime = 0;
+  private pendingFitTimer: ReturnType<typeof setTimeout> | null = null;
   private savedViewportY: number | null = null;
   readonly shellOnly: boolean;
   private themeId: string;
@@ -449,6 +451,10 @@ export class TerminalSessionManager {
       clearTimeout(this.fitDebounceTimer);
       this.fitDebounceTimer = null;
     }
+    if (this.pendingFitTimer) {
+      clearTimeout(this.pendingFitTimer);
+      this.pendingFitTimer = null;
+    }
 
     // Remove wheel listener
     if (this.currentContainer && this.wheelHandler) {
@@ -490,6 +496,10 @@ export class TerminalSessionManager {
     if (this.fitDebounceTimer) {
       clearTimeout(this.fitDebounceTimer);
       this.fitDebounceTimer = null;
+    }
+    if (this.pendingFitTimer) {
+      clearTimeout(this.pendingFitTimer);
+      this.pendingFitTimer = null;
     }
     if (this.resizeObserver) {
       this.resizeObserver.disconnect();
@@ -573,20 +583,42 @@ export class TerminalSessionManager {
   }
 
   private fit() {
+    // Defer fit() while terminal is actively receiving output to avoid
+    // buffer reflow during heavy writes which can corrupt the scroll area.
+    const timeSinceWrite = Date.now() - this.lastWriteTime;
+    if (timeSinceWrite < 500) {
+      if (this.pendingFitTimer) clearTimeout(this.pendingFitTimer);
+      this.pendingFitTimer = setTimeout(() => {
+        this.pendingFitTimer = null;
+        this.fit();
+      }, 500 - timeSinceWrite);
+      return;
+    }
+
     try {
+      const wasAtBottom = this.isAtBottom();
       this.fitAddon.fit();
       const dims = this.fitAddon.proposeDimensions();
       if (dims && dims.cols > 0 && dims.rows > 0) {
         // Skip redundant PTY resizes to avoid SIGWINCH prompt redraw
-        if (dims.cols === this.lastPtyCols && dims.rows === this.lastPtyRows) return;
-        this.lastPtyCols = dims.cols;
-        this.lastPtyRows = dims.rows;
-        window.electronAPI.ptyResize({
-          id: this.id,
-          cols: dims.cols,
-          rows: dims.rows,
-        });
+        if (dims.cols !== this.lastPtyCols || dims.rows !== this.lastPtyRows) {
+          this.lastPtyCols = dims.cols;
+          this.lastPtyRows = dims.rows;
+          window.electronAPI.ptyResize({
+            id: this.id,
+            cols: dims.cols,
+            rows: dims.rows,
+          });
+        }
       }
+      // After resize/reflow, force xterm to recalculate scroll area and
+      // restore bottom-pinned position if the user was already there.
+      if (wasAtBottom) {
+        this.terminal.scrollToBottom();
+      }
+      // Nudge viewport to refresh scroll area dimensions
+      this.terminal.scrollLines(0);
+      this.emitScrollState();
     } catch {
       // Ignore fit errors during transitions
     }
@@ -703,6 +735,7 @@ export class TerminalSessionManager {
       }
 
       this.terminal.write(data);
+      this.lastWriteTime = Date.now();
       this.snapshotDirty = true;
       this.checkMemory();
       this.debounceSaveSnapshot();
